@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Database files
+*.db
+.env
+
+# Folders
+db/
+subjects/
+
+# Others
+chat_history.db
+check_db.py
+requirements.txt
