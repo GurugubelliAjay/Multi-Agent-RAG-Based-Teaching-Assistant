@@ -16,4 +16,4 @@ subjects/
 # Others
 chat_history.db
 check_db.py
-requirements.txt
+# requirements.txt

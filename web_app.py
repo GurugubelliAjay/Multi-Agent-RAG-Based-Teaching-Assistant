@@ -253,21 +253,21 @@ elif st.session_state.current_view == "Course":
                 with chat_con:
                     with st.chat_message("user"): st.markdown(final_input)
                 
-                # --- NEW AGENTIC LOGIC ---
+                # --- NEW AGENTIC LOGIC (Live UI Updates) ---
                 if subject == "General Chat":
                     ans = ChatGroq(model="llama-3.1-8b-instant").invoke(final_input).content
                 else:
-                    # Add a status indicator so the user sees the "Agent" thinking
-                    with st.status("Agent working...", expanded=True) as status:
-                        st.write("🔍 Retrieving documents...")
-                        # The function call is now self-contained
+                    # The status box stays open while agents work
+                    with st.status("🤖 Initiating Multi-Agent Workflow...", expanded=True) as status:
                         from agent_tools import agentic_rag_response
-                        ans = agentic_rag_response(subject, final_input)
                         
-                        # Interpret the result for the UI
+                        # Pass the 'status' container so backend agents can write to it
+                        ans = agentic_rag_response(subject, final_input, status_container=status)
+                        
+                        # Interpret the final result to change the status box color/icon
                         if "I checked your notes, but" in ans:
                             status.update(label="❌ No relevant notes found", state="error", expanded=False)
-                        elif "**Warning" in ans:
+                        elif "Warning:" in ans: 
                             status.update(label="⚠️ Fact-check warning", state="error", expanded=False)
                         else:
                             status.update(label="✅ Verified Answer Generated", state="complete", expanded=False)

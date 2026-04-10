@@ -19,6 +19,7 @@ import json
 import sqlite3
 import time
 import io 
+import concurrent.futures
 
 # --- HEAVY IMPORTS (Now safe to load) ---
 import chromadb 
@@ -35,6 +36,11 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from groq import Groq 
 from langchain_experimental.text_splitter import SemanticChunker
+# --- NEW IMPORTS FOR ADVANCED AGENTS ---
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+from langchain.schema import Document
+import time
 
 # --- DIRECTORY SETUP ---
 DB_DIR = "db"
@@ -143,42 +149,42 @@ def rewrite_query(subject, user_question):
         return user_question
     
 
-def grade_documents(question, documents):
-    """
-    Evaluator Agent: Checks if retrieved docs are relevant.
-    Returns: A list of filtered, relevant documents.
-    """
-    print("--- AGENT: GRADING DOCUMENTS ---")
+def grade_documents(question, documents, status_container=None):
+    """Evaluator Agent: Batch Grades all documents in a SINGLE API call."""
+    if status_container: status_container.write("⚖️ **Grader Agent (CRAG):** Evaluating document relevance in batch mode...")
+    print("--- AGENT: GRADING DOCUMENTS (BATCH MODE) ---")
+    
+    if not documents: 
+        if status_container: status_container.write("⚠️ *Filtering:* No documents to grade.")
+        return []
+    
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    doc_text = "".join([f"\n--- Document {i} ---\n{d.page_content}\n" for i, d in enumerate(documents)])
+        
+    system = """You are a strict grader evaluating document relevance.
+    Analyze each document and determine if it helps answer the user's question.
+    Output ONLY a JSON list of the integers representing the relevant Document IDs.
+    If none are relevant, output an empty list []."""
     
-    # Prompt to force binary JSON decision
-    system = """You are a grader assessing relevance of a retrieved document to a user question. \n 
-    If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n
-    Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system),
+        ("human", "Question: {question}\n\nDocuments:\n{doc_text}")
+    ])
     
-    grade_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system),
-            ("human", "Retrieved document: \n\n {document} \n\n User question: {question}"),
-        ]
-    )
-    
-    grader_llm = grade_prompt | llm
-    
-    filtered_docs = []
-    for d in documents:
-        try:
-            score = grader_llm.invoke({"question": question, "document": d.page_content})
-            # Simple parsing check
-            if "yes" in score.content.lower():
-                print(f"DEBUG: Document kept (Relevant)")
-                filtered_docs.append(d)
-            else:
-                print(f"DEBUG: Document filtered out (Irrelevant)")
-        except:
-            filtered_docs.append(d) # Keep if grading fails to be safe
-            
-    return filtered_docs
+    try:
+        res = (prompt | llm).invoke({"question": question, "doc_text": doc_text}).content
+        match = re.search(r'\[.*\]', res, re.DOTALL)
+        if match:
+            relevant_ids = json.loads(match.group(0))
+            filtered_docs = [documents[i] for i in relevant_ids if isinstance(i, int) and i < len(documents)]
+            if status_container: status_container.write(f"✅ *Filtering Complete:* Kept **{len(filtered_docs)}/{len(documents)}** relevant chunks.")
+            print(f"DEBUG: Batch Grader kept {len(filtered_docs)}/{len(documents)} docs.")
+            return filtered_docs
+    except Exception as e:
+        print(f"Batch Grading Failed: {e}")
+        
+    if status_container: status_container.write(f"⚠️ *Fallback:* Kept all {len(documents)} docs due to parse error.")
+    return documents
 
 def check_hallucinations(context_text, answer):
     """
@@ -202,57 +208,171 @@ def check_hallucinations(context_text, answer):
     
     return "yes" in score.content.lower()
 
-def agentic_rag_response(subject, question):
-    """
-    Orchestrator: REWRITE -> Retrieval -> Grading -> Generation -> Verification -> CITATION
-    """
-    # --- STEP 0: REWRITE QUERY ---
-    # We use the rewritten query for searching, but the original question for generating the answer
-    # (keeps the conversation natural).
-    search_query = rewrite_query(subject, question)
+def planner_agent(question, status_container=None):
+    """1. PLANNER AGENT: Breaks complex questions into sub-queries for multi-hop reasoning."""
+    if status_container: status_container.write("🧠 **Planner Agent:** Analyzing query for multi-hop reasoning...")
+    print("--- AGENT: PLANNING ---")
     
-    # 1. RETRIEVAL (Use search_query, NOT question)
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    prompt = f"""You are a Task Planner. Break this user query into 1 to 3 logical sub-questions for a search engine. 
+    Query: {question}
+    Output ONLY a valid JSON list of strings. Example: ["What is a stack?", "What is a queue?", "Differences between them?"]"""
+    
+    try:
+        res = llm.invoke(prompt).content
+        match = re.search(r'\[.*\]', res, re.DOTALL)
+        if match: 
+            sub_qs = json.loads(match.group(0))
+            if status_container: status_container.write(f"🔀 *Sub-queries generated:* `{sub_qs}`")
+            return sub_qs
+    except Exception as e:
+        print(f"Planner Fallback: {e}")
+    
+    if status_container: status_container.write(f"🔀 *Using original query:* `['{question}']`")
+    return [question]
+
+def hybrid_retrieve(vectorstore, query, k=5):
+    """8. MULTI-RETRIEVER: Combines Vector Search (meaning) with BM25 (exact keyword)."""
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+    try:
+        # Build BM25 keyword index on the fly from current Chroma docs
+        db_data = vectorstore.get()
+        docs = db_data.get('documents', [])
+        metas = db_data.get('metadatas', [])
+        
+        if docs:
+            doc_objs = [Document(page_content=txt, metadata=m) for txt, m in zip(docs, metas)]
+            bm25_retriever = BM25Retriever.from_documents(doc_objs)
+            bm25_retriever.k = k
+            
+            # Combine them: 50% Vector weight, 50% Keyword weight
+            ensemble = EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.5, 0.5])
+            return ensemble.invoke(query)
+    except Exception as e:
+        print(f"Hybrid Retrieval Fallback (Using Vector Only): {e}")
+    
+    return vector_retriever.invoke(query)
+
+def critic_and_repair_agent(context, draft_answer, question, max_loops=2, status_container=None):
+    """2 & 3. COLLABORATION & REPAIR: Critic finds errors, Repair fixes them."""
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    current_answer = draft_answer
+    
+    for attempt in range(max_loops):
+        if status_container: status_container.write(f"🕵️ **Critic Agent:** Fact-checking draft against source text (Attempt {attempt+1})...")
+        print(f"--- AGENT: CRITIC (Attempt {attempt+1}) ---")
+        
+        critic_prompt = f"""Analyze this answer against the context. 
+        Context: {context}
+        Question: {question}
+        Answer: {current_answer}
+        If the answer contains hallucinated info NOT in the context, or misses the core question, output "FAIL: [Reason]".
+        If it is perfectly grounded and accurate, output "PASS"."""
+        
+        critique = llm.invoke(critic_prompt).content
+        
+        if "PASS" in critique.upper():
+            if status_container: status_container.write("🏆 *Validation Pass:* Answer is 100% grounded in syllabus context.")
+            print("DEBUG: Critic approved answer.")
+            return current_answer, True
+            
+        if status_container: status_container.write(f"🛠️ **Repair Agent:** Fixing hallucinations detected by Critic...")
+        print(f"--- AGENT: REPAIR (Fixing flaws) ---")
+        
+        repair_prompt = f"""You are a Repair Agent. 
+        Context: {context}
+        Question: {question}
+        Flawed Answer: {current_answer}
+        Critic Feedback: {critique}
+        Fix the answer based on the feedback. Use ONLY the provided context."""
+        
+        current_answer = llm.invoke(repair_prompt).content
+        
+    return current_answer, False
+
+def evaluation_agent(question, answer, relevant_docs, start_time, status_container=None):
+    """4 & 10. METRICS & CONFIDENCE: Calculates quantitative system scores."""
+    if status_container: status_container.write("📊 **Evaluation Agent:** Calculating confidence and precision metrics...")
+    print("--- AGENT: EVALUATION ---")
+    
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    prompt = f"""Evaluate this RAG system response.
+    Question: {question}
+    Answer: {answer}
+    Output ONLY a JSON object with these exact keys (values as integers 0-100):
+    {{"confidence_score": 90, "accuracy_score": 85, "retrieval_precision": 80}}"""
+    
+    try:
+        res = llm.invoke(prompt).content
+        match = re.search(r'\{.*\}', res, re.DOTALL)
+        metrics = json.loads(match.group(0))
+    except:
+        metrics = {"confidence_score": "N/A", "accuracy_score": "N/A", "retrieval_precision": "N/A"}
+        
+    metrics["response_time"] = round(time.time() - start_time, 2)
+    metrics["sources_used"] = len(relevant_docs)
+    return metrics
+
+import concurrent.futures
+
+def agentic_rag_response(subject, question, status_container=None):
+    """Advanced Orchestrator with UI Status Updates"""
+    start_time = time.time()
+    
+    # 1. PLANNER
+    sub_questions = planner_agent(question, status_container)
+    
     client = get_shared_client(DB_DIR)
     try:
         vectorstore = Chroma(client=client, collection_name=subject, embedding_function=get_embeddings())
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-        documents = retriever.invoke(search_query) # <--- UPDATED
     except:
         return "Error: Could not access subject database."
-
-    # 2. CRAG (Corrective RAG) - Filter Docs
-    # We check relevance against the CLEARED UP query
-    relevant_docs = grade_documents(search_query, documents) # <--- UPDATED
+        
+    # 2. RETRIEVE & POOL
+    raw_pooled_docs = []
+    unique_content = set()
+    for sq in sub_questions:
+        docs = hybrid_retrieve(vectorstore, sq, k=4) 
+        for d in docs:
+            if d.page_content not in unique_content:
+                unique_content.add(d.page_content)
+                raw_pooled_docs.append(d)
+                
+    if status_container: status_container.write(f"📚 **Hybrid Retriever:** Pooled **{len(raw_pooled_docs)}** unique document chunks from vector & keyword search.")
     
-    # 3. FALLBACK MECHANISM
-    if not relevant_docs:
-        return "I checked your notes, but I couldn't find any information relevant to that specific question. Please try rephrasing or check the uploaded PDFs."
-    
-    # --- CITATION LOGIC ---
-    unique_sources = set()
-    for doc in relevant_docs:
-        file_path = doc.metadata.get("source", "Unknown")
-        file_name = os.path.basename(file_path)
-        page_num = doc.metadata.get("page", 0) + 1 
-        unique_sources.add(f"- *{file_name}* (Page {page_num})")
-    sources_text = "\n\n---\n**📚 Sources:**\n" + "\n".join(sorted(unique_sources))
+    # 3. BATCH GRADE
+    all_relevant_docs = grade_documents(question, raw_pooled_docs, status_container)
+                
+    if not all_relevant_docs:
+        return "I checked your notes, but I couldn't find relevant information. Please try rephrasing."
+        
+    context_text = "\n\n".join([d.page_content for d in all_relevant_docs])
+    unique_sources = set([f"- *{os.path.basename(doc.metadata.get('source', 'Unknown'))}* (Page {doc.metadata.get('page', 0) + 1})" for doc in all_relevant_docs])
+    sources_text = "\n\n**📚 Sources Used:**\n" + "\n".join(unique_sources)
 
-    # 4. GENERATION
+    # 4. GENERATE
+    if status_container: status_container.write("✍️ **Generator Agent:** Drafting initial response using verified context...")
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    context_text = "\n\n".join([d.page_content for d in relevant_docs])
+    sys_prompt = f"You are a strict Teaching Assistant for {subject}. Answer ONLY based on the context:\n{context_text}"
+    draft_answer = llm.invoke([("system", sys_prompt), ("human", question)]).content
     
-    system_prompt = f"You are a Teaching Assistant for {subject}. Answer the question based ONLY on the following context:\n{context_text}"
-    messages = [("system", system_prompt), ("human", question)] # Keep original question for tone
+    # 5. CRITIC & REPAIR
+    final_answer, is_grounded = critic_and_repair_agent(context_text, draft_answer, question, 2, status_container)
     
-    generation = llm.invoke(messages).content
+    # 6. EVALUATE
+    metrics = evaluation_agent(question, final_answer, all_relevant_docs, start_time, status_container)
     
-    # 5. HALLUCINATION CHECK
-    is_grounded = check_hallucinations(context_text, generation)
+    metrics_text = (f"\n\n---\n**📊 Agent Evaluation Metrics:**\n"
+                    f"- **Confidence Score:** {metrics.get('confidence_score', 'N/A')}%\n"
+                    f"- **Accuracy Score:** {metrics.get('accuracy_score', 'N/A')}%\n"
+                    f"- **Retrieval Precision:** {metrics.get('retrieval_precision', 'N/A')}%\n"
+                    f"- **Sources Combined:** {metrics.get('sources_used', 0)} document chunks\n"
+                    f"- **Response Time:** {metrics.get('response_time', 'N/A')} seconds\n")
     
-    if is_grounded:
-        return generation + sources_text
-    else:
-        return f"**Warning (Agent Self-Correction):** I generated an answer, but upon reflection, it might not be fully supported by your notes. \n\n{generation}\n{sources_text}"
+    if not is_grounded:
+        return f"**⚠️ Repair Agent Warning:** Answer failed final hallucination checks but could not be perfectly repaired.\n\n{final_answer}\n{sources_text}{metrics_text}"
+        
+    return final_answer + "\n" + sources_text + metrics_text
     
 def get_rag_chain(subject):
     persist_dir = os.path.join(DB_DIR) # Use the root DB dir
