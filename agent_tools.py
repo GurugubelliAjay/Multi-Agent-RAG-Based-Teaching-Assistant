@@ -17,9 +17,11 @@ import random
 import shutil
 import json
 import sqlite3
+import hashlib
 import time
 import io 
 import concurrent.futures
+import uuid
 
 # --- HEAVY IMPORTS (Now safe to load) ---
 import chromadb 
@@ -53,36 +55,80 @@ os.makedirs(SUBJECTS_DIR, exist_ok=True)
 
 # --- 1. PERSISTENT CHAT DB ---
 def init_chat_db():
-    conn = sqlite3.connect(CHAT_DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS chats 
-                 (id INTEGER PRIMARY KEY, subject TEXT, role TEXT, content TEXT)''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS chats 
+                     (id INTEGER PRIMARY KEY, username TEXT, subject TEXT, role TEXT, content TEXT)''')
+        
+        # Migration: add username column if migrating from single-user version
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(chats)")
+        if 'username' not in [info[1] for info in cursor.fetchall()]:
+            conn.execute("ALTER TABLE chats ADD COLUMN username TEXT DEFAULT 'default_user'")
 
-def save_message(subject, role, content):
-    conn = sqlite3.connect(CHAT_DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO chats (subject, role, content) VALUES (?, ?, ?)", (subject, role, content))
-    conn.commit()
-    conn.close()
+def save_message(username, subject, role, content):
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute("INSERT INTO chats (username, subject, role, content) VALUES (?, ?, ?, ?)", (username, subject, role, content))
 
-def load_chat_history(subject):
-    conn = sqlite3.connect(CHAT_DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT role, content FROM chats WHERE subject=?", (subject,))
-    return [{"role": r[0], "content": r[1]} for r in c.fetchall()]
+def load_chat_history(username, subject):
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        cursor = conn.execute("SELECT role, content FROM chats WHERE username=? AND subject=?", (username, subject))
+        return [{"role": r[0], "content": r[1]} for r in cursor.fetchall()]
 
-def clear_chat_history(subject):
-    conn = sqlite3.connect(CHAT_DB_FILE)
-    c = conn.cursor()
-    # Delete all rows matching the subject
-    c.execute("DELETE FROM chats WHERE subject=?", (subject,))
-    conn.commit()
-    conn.close()
-    print(f"DEBUG: Database cleared for {subject}") # Useful for your terminal logs
+def clear_chat_history(username, subject):
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute("DELETE FROM chats WHERE username=? AND subject=?", (username, subject))
+    print(f"DEBUG: Database cleared for {username} - {subject}")
 
 init_chat_db()
+
+# --- 1.1 PERSISTENT USER DB ---
+def init_users_db():
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS users 
+                     (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT)''')
+
+init_users_db()
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password):
+    try:
+        with sqlite3.connect(CHAT_DB_FILE) as conn:
+            conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hash_password(password)))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def authenticate_user(username, password):
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        cursor = conn.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+        result = cursor.fetchone()
+    return result is not None and result[0] == hash_password(password)
+
+# --- 1.2 SESSION MANAGEMENT ---
+def init_sessions_db():
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS sessions 
+                     (token TEXT PRIMARY KEY, username TEXT)''')
+
+init_sessions_db()
+
+def create_session(username):
+    token = str(uuid.uuid4())
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute("INSERT INTO sessions (token, username) VALUES (?, ?)", (token, username))
+    return token
+
+def get_username_from_session(token):
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        cursor = conn.execute("SELECT username FROM sessions WHERE token=?", (token,))
+        result = cursor.fetchone()
+    return result[0] if result else None
+
+def destroy_session(token):
+    with sqlite3.connect(CHAT_DB_FILE) as conn:
+        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
 
 # --- 2. CORE TOOLS ---
 def get_embeddings(): return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -100,15 +146,19 @@ def get_safe_client(persist_dir):
             else:
                 raise e
 
+def get_collection_name(username, subject):
+    """Ensures ChromaDB collection names are valid and scoped to the user."""
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', f"{username}_{subject}").lower()[:63]
+
 # In agent_tools.py
 
-def rewrite_query(subject, user_question):
+def rewrite_query(username, subject, user_question):
     """
     Rewriter Agent: Contextualizes the user's question based on chat history.
     Example: "Tell me more" -> "Tell me more about the definition of photosynthesis."
     """
     # 1. Get the last few messages for context
-    history = load_chat_history(subject)
+    history = load_chat_history(username, subject)
     
     # If no history, the question is already standalone
     if not history:
@@ -151,11 +201,11 @@ def rewrite_query(subject, user_question):
 
 def grade_documents(question, documents, status_container=None):
     """Evaluator Agent: Batch Grades all documents in a SINGLE API call."""
-    if status_container: status_container.write("⚖️ **Grader Agent (CRAG):** Evaluating document relevance in batch mode...")
+    if status_container: status_container.write("**Grader Agent (CRAG):** Evaluating document relevance in batch mode...")
     print("--- AGENT: GRADING DOCUMENTS (BATCH MODE) ---")
     
     if not documents: 
-        if status_container: status_container.write("⚠️ *Filtering:* No documents to grade.")
+        if status_container: status_container.write("*Filtering:* No documents to grade.")
         return []
     
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
@@ -177,13 +227,13 @@ def grade_documents(question, documents, status_container=None):
         if match:
             relevant_ids = json.loads(match.group(0))
             filtered_docs = [documents[i] for i in relevant_ids if isinstance(i, int) and i < len(documents)]
-            if status_container: status_container.write(f"✅ *Filtering Complete:* Kept **{len(filtered_docs)}/{len(documents)}** relevant chunks.")
+            if status_container: status_container.write(f"*Filtering Complete:* Kept **{len(filtered_docs)}/{len(documents)}** relevant chunks.")
             print(f"DEBUG: Batch Grader kept {len(filtered_docs)}/{len(documents)} docs.")
             return filtered_docs
     except Exception as e:
         print(f"Batch Grading Failed: {e}")
         
-    if status_container: status_container.write(f"⚠️ *Fallback:* Kept all {len(documents)} docs due to parse error.")
+    if status_container: status_container.write(f"*Fallback:* Kept all {len(documents)} docs due to parse error.")
     return documents
 
 def check_hallucinations(context_text, answer):
@@ -210,7 +260,7 @@ def check_hallucinations(context_text, answer):
 
 def planner_agent(question, status_container=None):
     """1. PLANNER AGENT: Breaks complex questions into sub-queries for multi-hop reasoning."""
-    if status_container: status_container.write("🧠 **Planner Agent:** Analyzing query for multi-hop reasoning...")
+    if status_container: status_container.write("**Planner Agent:** Analyzing query for multi-hop reasoning...")
     print("--- AGENT: PLANNING ---")
     
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
@@ -223,12 +273,12 @@ def planner_agent(question, status_container=None):
         match = re.search(r'\[.*\]', res, re.DOTALL)
         if match: 
             sub_qs = json.loads(match.group(0))
-            if status_container: status_container.write(f"🔀 *Sub-queries generated:* `{sub_qs}`")
+            if status_container: status_container.write(f"*Sub-queries generated:* `{sub_qs}`")
             return sub_qs
     except Exception as e:
         print(f"Planner Fallback: {e}")
     
-    if status_container: status_container.write(f"🔀 *Using original query:* `['{question}']`")
+    if status_container: status_container.write(f"*Using original query:* `['{question}']`")
     return [question]
 
 def hybrid_retrieve(vectorstore, query, k=5):
@@ -259,7 +309,7 @@ def critic_and_repair_agent(context, draft_answer, question, max_loops=2, status
     current_answer = draft_answer
     
     for attempt in range(max_loops):
-        if status_container: status_container.write(f"🕵️ **Critic Agent:** Fact-checking draft against source text (Attempt {attempt+1})...")
+        if status_container: status_container.write(f"**Critic Agent:** Fact-checking draft against source text (Attempt {attempt+1})...")
         print(f"--- AGENT: CRITIC (Attempt {attempt+1}) ---")
         
         critic_prompt = f"""Analyze this answer against the context. 
@@ -272,11 +322,11 @@ def critic_and_repair_agent(context, draft_answer, question, max_loops=2, status
         critique = llm.invoke(critic_prompt).content
         
         if "PASS" in critique.upper():
-            if status_container: status_container.write("🏆 *Validation Pass:* Answer is 100% grounded in syllabus context.")
+            if status_container: status_container.write("*Validation Pass:* Answer is 100% grounded in syllabus context.")
             print("DEBUG: Critic approved answer.")
             return current_answer, True
             
-        if status_container: status_container.write(f"🛠️ **Repair Agent:** Fixing hallucinations detected by Critic...")
+        if status_container: status_container.write(f"**Repair Agent:** Fixing hallucinations detected by Critic...")
         print(f"--- AGENT: REPAIR (Fixing flaws) ---")
         
         repair_prompt = f"""You are a Repair Agent. 
@@ -292,7 +342,7 @@ def critic_and_repair_agent(context, draft_answer, question, max_loops=2, status
 
 def evaluation_agent(question, answer, relevant_docs, start_time, status_container=None):
     """4 & 10. METRICS & CONFIDENCE: Calculates quantitative system scores."""
-    if status_container: status_container.write("📊 **Evaluation Agent:** Calculating confidence and precision metrics...")
+    if status_container: status_container.write("**Evaluation Agent:** Calculating confidence and precision metrics...")
     print("--- AGENT: EVALUATION ---")
     
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
@@ -315,7 +365,7 @@ def evaluation_agent(question, answer, relevant_docs, start_time, status_contain
 
 import concurrent.futures
 
-def agentic_rag_response(subject, question, status_container=None):
+def agentic_rag_response(username, subject, question, status_container=None):
     """Advanced Orchestrator with UI Status Updates"""
     start_time = time.time()
     
@@ -323,8 +373,9 @@ def agentic_rag_response(subject, question, status_container=None):
     sub_questions = planner_agent(question, status_container)
     
     client = get_shared_client(DB_DIR)
+    col_name = get_collection_name(username, subject)
     try:
-        vectorstore = Chroma(client=client, collection_name=subject, embedding_function=get_embeddings())
+        vectorstore = Chroma(client=client, collection_name=col_name, embedding_function=get_embeddings())
     except:
         return "Error: Could not access subject database."
         
@@ -338,7 +389,7 @@ def agentic_rag_response(subject, question, status_container=None):
                 unique_content.add(d.page_content)
                 raw_pooled_docs.append(d)
                 
-    if status_container: status_container.write(f"📚 **Hybrid Retriever:** Pooled **{len(raw_pooled_docs)}** unique document chunks from vector & keyword search.")
+    if status_container: status_container.write(f"**Hybrid Retriever:** Pooled **{len(raw_pooled_docs)}** unique document chunks from vector & keyword search.")
     
     # 3. BATCH GRADE
     all_relevant_docs = grade_documents(question, raw_pooled_docs, status_container)
@@ -348,12 +399,12 @@ def agentic_rag_response(subject, question, status_container=None):
         
     context_text = "\n\n".join([d.page_content for d in all_relevant_docs])
     unique_sources = set([f"- *{os.path.basename(doc.metadata.get('source', 'Unknown'))}* (Page {doc.metadata.get('page', 0) + 1})" for doc in all_relevant_docs])
-    sources_text = "\n\n**📚 Sources Used:**\n" + "\n".join(unique_sources)
+    sources_text = "\n\n**Sources Used:**\n" + "\n".join(unique_sources)
 
     # 4. GENERATE
-    if status_container: status_container.write("✍️ **Generator Agent:** Drafting initial response using verified context...")
+    if status_container: status_container.write("**Generator Agent:** Drafting initial response using verified context...")
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    sys_prompt = f"You are a strict Teaching Assistant for {subject}. Answer ONLY based on the context:\n{context_text}"
+    sys_prompt = f"You are a strict AI Tutor for {subject}. Answer ONLY based on the context:\n{context_text}"
     draft_answer = llm.invoke([("system", sys_prompt), ("human", question)]).content
     
     # 5. CRITIC & REPAIR
@@ -362,7 +413,7 @@ def agentic_rag_response(subject, question, status_container=None):
     # 6. EVALUATE
     metrics = evaluation_agent(question, final_answer, all_relevant_docs, start_time, status_container)
     
-    metrics_text = (f"\n\n---\n**📊 Agent Evaluation Metrics:**\n"
+    metrics_text = (f"\n\n---\n**Agent Evaluation Metrics:**\n"
                     f"- **Confidence Score:** {metrics.get('confidence_score', 'N/A')}%\n"
                     f"- **Accuracy Score:** {metrics.get('accuracy_score', 'N/A')}%\n"
                     f"- **Retrieval Precision:** {metrics.get('retrieval_precision', 'N/A')}%\n"
@@ -370,26 +421,27 @@ def agentic_rag_response(subject, question, status_container=None):
                     f"- **Response Time:** {metrics.get('response_time', 'N/A')} seconds\n")
     
     if not is_grounded:
-        return f"**⚠️ Repair Agent Warning:** Answer failed final hallucination checks but could not be perfectly repaired.\n\n{final_answer}\n{sources_text}{metrics_text}"
+        return f"**Repair Agent Warning:** Answer failed final hallucination checks but could not be perfectly repaired.\n\n{final_answer}\n{sources_text}{metrics_text}"
         
     return final_answer + "\n" + sources_text + metrics_text
     
-def get_rag_chain(subject):
+def get_rag_chain(username, subject):
     persist_dir = os.path.join(DB_DIR) # Use the root DB dir
     if not os.path.exists(persist_dir): return None
     
     # Use the shared client instead of creating a new one
     client = get_shared_client(persist_dir)
+    col_name = get_collection_name(username, subject)
     
     # Check if collection exists
     try:
         # Check if the subject actually has data in the client
         collections = [c.name for c in client.list_collections()]
-        if subject not in collections: return None
+        if col_name not in collections: return None
         
         vectorstore = Chroma(
             client=client, 
-            collection_name=subject, 
+            collection_name=col_name, 
             embedding_function=get_embeddings()
         )
     except: return None
@@ -398,7 +450,7 @@ def get_rag_chain(subject):
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
     
     system_prompt = (
-        f"You are a strict Teaching Assistant for {subject}. "
+        f"You are a strict AI Tutor for {subject}. "
         "Use ONLY the following context to answer. If not there, say you don't know.\n\n"
         "Context: {context}"
     )
@@ -417,8 +469,8 @@ def get_shared_client(persist_dir):
         CHROMA_CLIENT = chromadb.PersistentClient(path=DB_DIR)
     return CHROMA_CLIENT
 
-def handle_file_upload(subject_name, uploaded_files):
-    subject_path = os.path.join(SUBJECTS_DIR, subject_name)
+def handle_file_upload(username, subject_name, uploaded_files):
+    subject_path = os.path.join(SUBJECTS_DIR, username, subject_name)
     os.makedirs(subject_path, exist_ok=True)
     
     client = get_shared_client(DB_DIR)
@@ -448,36 +500,41 @@ def handle_file_upload(subject_name, uploaded_files):
             print(f"DEBUG: Created {len(splits)} semantic chunks.")
             # -------------------------------------
             
+            col_name = get_collection_name(username, subject_name)
             vectorstore = Chroma.from_documents(
                 documents=splits,
                 embedding=get_embeddings(),
-                collection_name=subject_name,
+                collection_name=col_name,
                 persist_directory=DB_DIR,
                 client=client
             )
             time.sleep(1) 
             print(f"DEBUG: Indexed {len(splits)} chunks into {subject_name}")
 
-def delete_file(subject, filename):
-    path = os.path.join(SUBJECTS_DIR, subject, filename)
+def delete_file(username, subject, filename):
+    path = os.path.join(SUBJECTS_DIR, username, subject, filename)
     if os.path.exists(path): os.remove(path)
-    handle_file_upload(subject, []) # Rebuild empty or remaining
+    handle_file_upload(username, subject, []) 
 
-def delete_subject(subject):
-    s_path = os.path.join(SUBJECTS_DIR, subject)
-    d_path = os.path.join(DB_DIR, subject)
+def delete_subject(username, subject):
+    s_path = os.path.join(SUBJECTS_DIR, username, subject)
     if os.path.exists(s_path): shutil.rmtree(s_path)
-    if os.path.exists(d_path): shutil.rmtree(d_path)
-    clear_chat_history(subject)
+    
+    client = get_shared_client(DB_DIR)
+    col_name = get_collection_name(username, subject)
+    try: client.delete_collection(col_name)
+    except: pass
+    clear_chat_history(username, subject)
 
-def list_files(subject):
-    path = os.path.join(SUBJECTS_DIR, subject)
+def list_files(username, subject):
+    path = os.path.join(SUBJECTS_DIR, username, subject)
     return [f for f in os.listdir(path) if f.endswith(".pdf")] if os.path.exists(path) else []
 
-def generate_quiz(subject):
+def generate_quiz(username, subject):
     client = get_shared_client(DB_DIR)
+    col_name = get_collection_name(username, subject)
     try:
-        vectorstore = Chroma(client=client, collection_name=subject, embedding_function=get_embeddings())
+        vectorstore = Chroma(client=client, collection_name=col_name, embedding_function=get_embeddings())
         
         # 1. SEARCH ANGLES (To prevent repetitive questions)
         search_angles = [
@@ -554,13 +611,14 @@ def generate_quiz(subject):
         print(f"Quiz JSON Error: {e} | Raw: {res[:50]}...")
         return []
 
-def generate_summary(subject):
+def generate_summary(username, subject):
     client = get_shared_client(DB_DIR)
+    col_name = get_collection_name(username, subject)
     try:
         collections = [c.name for c in client.list_collections()]
-        if subject not in collections: return "No documents found."
+        if col_name not in collections: return "No documents found."
         
-        vectorstore = Chroma(client=client, collection_name=subject, embedding_function=get_embeddings())
+        vectorstore = Chroma(client=client, collection_name=col_name, embedding_function=get_embeddings())
         # Increase k to get a broader view of the document for a summary
         docs = vectorstore.as_retriever(search_kwargs={"k": 15}).invoke("main topics and overview")
         context = "\n".join([d.page_content for d in docs])
@@ -569,10 +627,11 @@ def generate_summary(subject):
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.3)
     return llm.invoke(f"Create a 1-page Cheat Sheet from:\n{context[:12000]}").content
 
-def generate_flashcards(subject):
+def generate_flashcards(username, subject):
     client = get_shared_client(DB_DIR)
+    col_name = get_collection_name(username, subject)
     try:
-        vectorstore = Chroma(client=client, collection_name=subject, embedding_function=get_embeddings())
+        vectorstore = Chroma(client=client, collection_name=col_name, embedding_function=get_embeddings())
         
         # 1. SEARCH FOR DENSE CONTENT
         # We look for terms that likely contain lists, definitions, and examples

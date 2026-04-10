@@ -4,89 +4,151 @@ load_dotenv()
 
 # --- STANDARD IMPORTS ---
 import streamlit as st
-from streamlit_option_menu import option_menu
 from streamlit_mic_recorder import mic_recorder
 from langchain_groq import ChatGroq
+import requests
+from streamlit_lottie import st_lottie
+import streamlit_shadcn_ui as ui
+import streamlit_antd_components as sac
+
+@st.cache_data
+def load_lottieurl(url: str):
+    try:
+        r = requests.get(url)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        return None
+    return None
 
 # ... rest of your imports
 from agent_tools import (get_rag_chain, handle_file_upload, delete_file, list_files, 
                          delete_subject, generate_quiz, generate_summary, 
                          load_chat_history, save_message, clear_chat_history, 
-                         generate_flashcards, transcribe_audio)
+                         generate_flashcards, transcribe_audio,
+                         register_user, authenticate_user,
+                         create_session, get_username_from_session, destroy_session)
 
-st.set_page_config(page_title="AI Learning Hub", page_icon=":material/school:", layout="wide")
+st.set_page_config(page_title="Student Hub", page_icon=":material/school:", layout="wide")
+
+# --- MULTI-USER AUTHENTICATION ---
+if "authenticated" not in st.session_state: 
+    st.session_state.authenticated = False
+    st.session_state.username = None
+
+# Persistent login check via URL query parameters
+if not st.session_state.authenticated and "session_token" in st.query_params:
+    token = st.query_params["session_token"]
+    username = get_username_from_session(token)
+    if username:
+        st.session_state.authenticated = True
+        st.session_state.username = username
+        st.session_state.session_token = token
+    else:
+        del st.query_params["session_token"] # Clean up invalid/expired tokens
+
+if not st.session_state.authenticated:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        lottie_hello = load_lottieurl("https://lottie.host/65e94b43-6901-4ec9-8666-6b2256422b40/gK7P59hWw4.json")
+        if lottie_hello:
+            st_lottie(lottie_hello, height=200, key="hello")
+        st.title("Welcome to Student Hub")
+        
+        tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
+        
+        with tab_login:
+            with st.form("login_form", border=True):
+                user = st.text_input("Username")
+                pwd = st.text_input("Password", type="password")
+                if st.form_submit_button("Login", type="primary", use_container_width=True):
+                    if authenticate_user(user, pwd):
+                        st.session_state.authenticated = True
+                        st.session_state.username = user
+                        token = create_session(user)
+                        st.session_state.session_token = token
+                        st.query_params["session_token"] = token # Add token to URL
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
+                        
+        with tab_signup:
+            with st.form("signup_form", border=True):
+                new_user = st.text_input("Choose a Username")
+                new_pwd = st.text_input("Choose a Password", type="password")
+                confirm_pwd = st.text_input("Confirm Password", type="password")
+                if st.form_submit_button("Sign Up", type="primary", use_container_width=True):
+                    if new_pwd != confirm_pwd:
+                        st.error("Passwords do not match.")
+                    elif len(new_user) < 3 or len(new_pwd) < 6:
+                        st.error("Username must be at least 3 characters and password at least 6 characters.")
+                    else:
+                        if register_user(new_user, new_pwd):
+                            st.success("Account created successfully! You can now log in.")
+                        else:
+                            st.error("Username already exists. Please choose another one.")
+    st.stop()
 
 # --- MASTER CSS STYLING ---
 st.markdown("""
 <style>
-    /* 1. GAPLESS DASHBOARD CARDS */
-    div[data-testid="column"] div[data-testid="stImage"] { margin-bottom: -18px !important; }
-    div[data-testid="column"] .stButton button {
-        border-radius: 0px 0px 12px 12px !important;
-        border-top: none !important;
-        border: 1px solid #ddd;
-        background-color: #f9f9f9;
-        color: #333;
-        font-weight: 600;
-        width: 100%;
-    }
-    div[data-testid="column"] .stButton button:hover { background-color: #ececec; color: #000; }
-    div[data-testid="column"] img { border-radius: 12px 12px 0px 0px !important; object-fit: cover; }
+    /* Import Google Font */
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
 
-    /* 2. GENERAL BUTTONS */
+    /* Apply Google Font smoothly without aggressive wildcard classes */
+    html, body, .stApp, h1, h2, h3, h4, h5, h6, p, label, button, input, li {
+        font-family: 'Outfit', sans-serif !important;
+    }
+    
+    /* Safely protect all variations of Material Icons */
+    .material-symbols-rounded, 
+    [data-testid="stIconMaterial"] {
+        font-family: 'Material Symbols Rounded' !important;
+        font-weight: normal !important;
+        font-style: normal !important;
+    }
+
+    /* 1. GENERAL BUTTONS */
     .stButton button { border-radius: 8px; transition: all 0.2s; }
 
-    /* 3. PRIMARY BUTTONS (Green) */
+    /* 2. SECONDARY BUTTONS (White to match Mic Recorder) */
+    button[kind="secondary"] {
+        background-color: #ffffff !important;
+        border: 1px solid #e2e8f0 !important;
+        color: #0f172a !important;
+        font-weight: 500;
+    }
+    button[kind="secondary"]:hover, button[kind="secondary"]:focus {
+        background-color: #f8fafc !important;
+        border-color: #cbd5e1 !important;
+        color: #0f172a !important;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        outline: none !important;
+    }
+    
+    /* 3. FIX MIC RECORDER CLIPPING (Reveals bottom border) */
+    iframe[title*="mic_recorder"] {
+        min-height: 45px !important;
+    }
+
+    /* 4. PRIMARY BUTTONS (Green) */
     button[kind="primary"] {
         background-color: #2da44e !important;
         border-color: #2da44e !important;
         color: white !important;
+        font-weight: 600;
     }
-    button[kind="primary"]:hover {
+    button[kind="primary"]:hover, button[kind="primary"]:focus {
         background-color: #2a9147 !important;
         border-color: #2a9147 !important;
-    }
-    
-    /* 4. FLASHCARD STYLING (Colorful & Big) */
-    /* Target the buttons inside the Flashcard Tab specifically */
-    /* We assume flashcards appear as a vertical stack of buttons */
-    
-    /* Card 1: Pink */
-    div[data-testid="stVerticalBlock"] > div > div > div > div > .stButton:nth-child(2) button {
-        background-color: #FFADAD !important; color: #333 !important; border: 2px solid #FFADAD; height: 150px; font-size: 18px;
-    }
-    /* Card 2: Orange */
-    div[data-testid="stVerticalBlock"] > div > div > div > div > .stButton:nth-child(3) button {
-        background-color: #FFD6A5 !important; color: #333 !important; border: 2px solid #FFD6A5; height: 150px; font-size: 18px;
-    }
-    /* Card 3: Yellow */
-    div[data-testid="stVerticalBlock"] > div > div > div > div > .stButton:nth-child(4) button {
-        background-color: #FDFFB6 !important; color: #333 !important; border: 2px solid #FDFFB6; height: 150px; font-size: 18px;
-    }
-    /* Card 4: Green */
-    div[data-testid="stVerticalBlock"] > div > div > div > div > .stButton:nth-child(5) button {
-        background-color: #CAFFBF !important; color: #333 !important; border: 2px solid #CAFFBF; height: 150px; font-size: 18px;
-    }
-    /* Card 5: Blue */
-    div[data-testid="stVerticalBlock"] > div > div > div > div > .stButton:nth-child(6) button {
-        background-color: #9BF6FF !important; color: #333 !important; border: 2px solid #9BF6FF; height: 150px; font-size: 18px;
-    }
-    
-    /* Hover effects for Flashcards: slight lift + shadow */
-    div[data-testid="stVerticalBlock"] > div > div > div > div > .stButton button:hover {
         transform: translateY(-2px);
         box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        outline: none !important;
     }
     
 </style>
 """, unsafe_allow_html=True)
-
-# --- CONFIG ---
-CARD_COLORS = [
-    "FFADAD", "FFD6A5", "FDFFB6", "CAFFBF", 
-    "9BF6FF", "A0C4FF", "BDB2FF", "FFC6FF",
-    "FFFFFC", "B5EAD7"
-]
 
 # State Init
 if "current_view" not in st.session_state: st.session_state.current_view = "Dashboard"
@@ -104,13 +166,10 @@ with st.sidebar:
     st.image("https://d2lk14jtvqry1q.cloudfront.net/media/large_299_abb805a780_463efb8229.png", width=300)
     st.markdown("<br>", unsafe_allow_html=True)
     
-    selected_nav = option_menu(
-        menu_title=None,
-        options=["Dashboard", "General Chat"],
-        icons=["house", "chat-dots"],
-        default_index=0,
-        styles={"nav-link-selected": {"background-color": "#2da44e"}}
-    )
+    selected_nav = sac.menu([
+        sac.MenuItem('Dashboard', icon='house'),
+        sac.MenuItem('General Chat', icon='chat-dots'),
+    ], size='md', variant='filled', color='#2da44e')
     
     if selected_nav != st.session_state.sidebar_selection:
         st.session_state.sidebar_selection = selected_nav
@@ -123,38 +182,57 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    with st.expander("New Course", icon=":material/add_circle:"):
+    with st.expander("New Notebook", icon=":material/add_circle:"):
         new_sub = st.text_input("Name")
-        if st.button("Create", width="stretch", type="primary", icon=":material/add:") and new_sub:
+        if st.button("Create", use_container_width=True, type="primary", icon=":material/add:") and new_sub:
             os.makedirs(f"subjects/{new_sub}", exist_ok=True)
+            os.makedirs(f"subjects/{st.session_state.username}/{new_sub}", exist_ok=True)
             st.rerun()
+            
+    st.divider()
+    st.caption(f"Logged in as: **{st.session_state.username}**")
+    if st.button("Logout", icon=":material/logout:", use_container_width=True):
+        if "session_token" in st.session_state:
+            destroy_session(st.session_state.session_token)
+        if "session_token" in st.query_params:
+            del st.query_params["session_token"]
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.rerun()
 
 # --- DASHBOARD ---
 if st.session_state.current_view == "Dashboard":
-    st.title("My Learning Hub")
+    st.title("My Notebooks")
     if not os.path.exists("subjects"): os.makedirs("subjects")
     subjects = [d for d in os.listdir("subjects") if os.path.isdir(os.path.join("subjects", d))]
     
-    if not subjects: st.info("Create a course in the sidebar to begin!")
+    user_subjects_dir = os.path.join("subjects", st.session_state.username)
+    if not os.path.exists(user_subjects_dir): os.makedirs(user_subjects_dir)
+    subjects = [d for d in os.listdir(user_subjects_dir) if os.path.isdir(os.path.join(user_subjects_dir, d))]
+    
+    if not subjects: st.info("Create a notebook in the sidebar to begin!")
     
     cols = st.columns(3)
     for i, sub in enumerate(subjects):
         with cols[i % 3]:
-            color = CARD_COLORS[i % len(CARD_COLORS)]
-            st.image(f"https://placehold.co/600x300/{color}/{color}.png", width="stretch")
-            if st.button(f"{sub}", key=f"btn_{sub}", width="stretch"):
-                st.session_state.current_view = "Course"
-                st.session_state.active_subject = sub
-                st.rerun()
+            with st.container(border=True):
+                files = list_files(st.session_state.username, sub)
+                st.subheader(sub)
+                st.caption(f"**{len(files)}** document{'s' if len(files) != 1 else ''} attached")
+                
+                if st.button("Open Notebook", key=f"btn_{sub}", use_container_width=True, type="primary"):
+                    st.session_state.current_view = "Course"
+                    st.session_state.active_subject = sub
+                    st.rerun()
 
 # --- COURSE VIEW ---
 elif st.session_state.current_view == "Course":
     subject = st.session_state.active_subject
     
-    c1, c2 = st.columns([0.85, 0.15])
+    c1, c2 = st.columns([0.8, 0.2])
     with c1: st.title(f"{subject}")
     with c2: 
-        if st.button("Dashboard", width="stretch", type="primary", icon=":material/arrow_back:"):
+        if st.button("Dashboard", use_container_width=True, type="primary", icon=":material/arrow_back:"):
             st.session_state.current_view = "Dashboard"
             st.rerun()
 
@@ -180,12 +258,12 @@ elif st.session_state.current_view == "Course":
                 )
                 
                 if up:
-                    existing_files = list_files(subject)
+                    existing_files = list_files(st.session_state.username, subject)
                     new_files = [f for f in up if f.name not in existing_files]
                     
                     if new_files:
                         with st.spinner("Processing New Files..."):
-                            handle_file_upload(subject, new_files)
+                            handle_file_upload(st.session_state.username, subject, new_files)
                         
                         # THE FIX: Increment the key to clear the uploader UI
                         st.session_state.uploader_key += 1
@@ -195,7 +273,7 @@ elif st.session_state.current_view == "Course":
                 # ... (rest of your file listing code)
                 
                 # Display Files Section
-                files = list_files(subject)
+                files = list_files(st.session_state.username, subject)
                 if not files:
                     st.caption("No files uploaded yet.")
                 else:
@@ -203,41 +281,46 @@ elif st.session_state.current_view == "Course":
                         fc1, fc2 = st.columns([0.8, 0.2])
                         fc1.caption(f)
                         # Red-styled delete button for files
+                        fc2.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
                         if fc2.button("", key=f"del_{f}", icon=":material/delete:", type="primary"): 
-                            delete_file(subject, f)
+                            delete_file(st.session_state.username, subject, f)
                             st.rerun()
                 
                 st.divider()
-                if st.button("Delete Course", width="stretch", icon=":material/delete_forever:"):
-                    delete_subject(subject)
+                st.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
+                if st.button("Delete Notebook", use_container_width=True, icon=":material/delete_forever:"):
+                    delete_subject(st.session_state.username, subject)
                     st.session_state.current_view = "Dashboard"
                     st.rerun()
 
     # Main Area
     with col_main:
-        tabs = option_menu(None, ["Chat", "Quiz", "Summaries", "Flashcards"], 
-                           icons=["chat", "pencil", "file-text", "card-checklist"], 
-                           orientation="horizontal")
+        tabs = sac.tabs([
+            sac.TabsItem(label='Chat', icon='chat-text'),
+            sac.TabsItem(label='Quiz', icon='controller'),
+            sac.TabsItem(label='Summaries', icon='file-earmark-text'),
+            sac.TabsItem(label='Flashcards', icon='layers'),
+        ], align='center', size='md', variant='outline', color='#2da44e')
         
         # TAB 1: CHAT
         if tabs == "Chat":
-            history = load_chat_history(subject)
-            chat_con = st.container(height=450)
+            history = load_chat_history(st.session_state.username, subject)
+            chat_con = st.container(height=450, border=True)
             with chat_con:
                 for m in history:
                     with st.chat_message(m["role"]): st.markdown(m["content"])
             
             prompt = st.chat_input("Type a message...")
-            c_voice, c_reset = st.columns([0.2, 0.8])
+
+            c_voice, c_reset = st.columns([0.15, 0.85])
             with c_voice:
-                audio = mic_recorder(start_prompt="🎤", stop_prompt="⏹️", key='recorder')
+                audio = mic_recorder(start_prompt="Speak", stop_prompt="Stop", key='recorder')
             with c_reset:
-                if st.button("Clear Chat", width="stretch", type="primary", icon=":material/delete_sweep:"):
-                    clear_chat_history(subject)
-                    # This resets the voice recording state
+                if st.button("Clear Chat", use_container_width=True, type="secondary", icon=":material/delete_sweep:"):
+                    clear_chat_history(st.session_state.username, subject)
                     st.session_state.last_audio = None 
                     st.toast(f"Chat history for {subject} cleared!")
-                    st.rerun() # This forces the page to reload and call load_chat_history()
+                    st.rerun()
 
             final_input = None
             if prompt: final_input = prompt
@@ -249,50 +332,55 @@ elif st.session_state.current_view == "Course":
                         if text: final_input = text
             
             if final_input:
-                save_message(subject, "user", final_input)
+                save_message(st.session_state.username, subject, "user", final_input)
                 with chat_con:
                     with st.chat_message("user"): st.markdown(final_input)
                 
-                # --- NEW AGENTIC LOGIC (Live UI Updates) ---
                 if subject == "General Chat":
-                    ans = ChatGroq(model="llama-3.1-8b-instant").invoke(final_input).content
+                    with chat_con:
+                        with st.chat_message("assistant"):
+                            with st.spinner("Thinking..."):
+                                ans = ChatGroq(model="llama-3.1-8b-instant").invoke(final_input).content
+                                st.markdown(ans)
                 else:
-                    # The status box stays open while agents work
-                    with st.status("🤖 Initiating Multi-Agent Workflow...", expanded=True) as status:
-                        from agent_tools import agentic_rag_response
-                        
-                        # Pass the 'status' container so backend agents can write to it
-                        ans = agentic_rag_response(subject, final_input, status_container=status)
-                        
-                        # Interpret the final result to change the status box color/icon
-                        if "I checked your notes, but" in ans:
-                            status.update(label="❌ No relevant notes found", state="error", expanded=False)
-                        elif "Warning:" in ans: 
-                            status.update(label="⚠️ Fact-check warning", state="error", expanded=False)
-                        else:
-                            status.update(label="✅ Verified Answer Generated", state="complete", expanded=False)
+                    with chat_con:
+                        with st.chat_message("assistant"):
+                            with st.status("Initiating Multi-Agent Workflow...", expanded=True) as status:
+                                from agent_tools import agentic_rag_response
+                                ans = agentic_rag_response(st.session_state.username, subject, final_input, status_container=status)
+                                
+                                if "I checked your notes, but" in ans:
+                                    status.update(label="No relevant notes found", state="error", expanded=False)
+                                elif "Warning:" in ans: 
+                                    status.update(label="Fact-check warning", state="error", expanded=False)
+                                else:
+                                    status.update(label="Verified Answer Generated", state="complete", expanded=False)
+                            st.markdown(ans)
                 
-                save_message(subject, "assistant", ans)
+                save_message(st.session_state.username, subject, "assistant", ans)
                 st.rerun()
 
         # TAB 2: QUIZ
         elif tabs == "Quiz":
-            if subject == "General Chat": st.warning("Open a course.")
+            if subject == "General Chat": st.warning("Open a notebook.")
             else:
-                if st.button("New Quiz", width="stretch", type="primary", icon=":material/casino:"):
-                    with st.spinner("Generating..."):
-                        st.session_state.quiz_data[subject] = generate_quiz(subject)
+                if st.button("New Quiz", use_container_width=True, type="primary", icon=":material/casino:"):
+                    with st.container(border=True):
+                        lottie_quiz = load_lottieurl("https://lottie.host/26251b5c-4e4f-4d92-80ea-3e75b9ea8925/tC6AylD6s0.json")
+                        if lottie_quiz: st_lottie(lottie_quiz, height=150)
+                        st.info("Generating your personalized quiz...")
+                        st.session_state.quiz_data[subject] = generate_quiz(st.session_state.username, subject)
                         st.rerun()
                 
                 if subject in st.session_state.quiz_data:
                     quiz = st.session_state.quiz_data[subject]
                     if not quiz: st.error("Not enough text found in PDFs to generate questions.")
                     else:
-                        # We use a form so the UI doesn't refresh every time you click a radio button
-                        with st.form("quiz_form"):
+                        with st.form("quiz_form", border=True):
+                            st.subheader("Knowledge Check")
                             user_answers = []
                             for i, q in enumerate(quiz):
-                                st.markdown(f"### Q{i+1}: {q['question']}")
+                                st.markdown(f"**Q{i+1}: {q['question']}**")
                                 choice = st.radio("Select an answer:", q['options'], key=f"quiz_opt_{i}")
                                 user_answers.append(choice)
                                 st.divider()
@@ -301,38 +389,39 @@ elif st.session_state.current_view == "Course":
                             
                         if submitted:
                             score = 0
-                            for i, q in enumerate(quiz):
-                                is_correct = user_answers[i] == q['answer']
-                                if is_correct:
-                                    score += 1
-                                    st.success(f"**Question {i+1}: Correct!**")
-                                else:
-                                    st.error(f"**Question {i+1}: Incorrect.**")
-                                    st.info(f"**Correct Answer:** {q['answer']}")
+                            with st.container(border=True):
+                                st.subheader("Quiz Results")
+                                for i, q in enumerate(quiz):
+                                    is_correct = user_answers[i] == q['answer']
+                                    if is_correct:
+                                        score += 1
+                                        st.success(f"**Question {i+1}: Correct!**")
+                                    else:
+                                        st.error(f"**Question {i+1}: Incorrect.**")
+                                        st.info(f"**Correct Answer:** {q['answer']}")
+                                    
+                                    st.write(f"*Explanation:* {q['explanation']}")
+                                    st.divider()
                                 
-                                # --- THE FIX: Display the Explanation ---
-                                st.write(f"*Explanation:* {q['explanation']}")
-                                st.divider()
-                            
-                            st.metric("Final Score", f"{score}/{len(quiz)}")
+                                ui.metric_card(title="Final Score", content=f"{score} / {len(quiz)}", description="Knowledge Check Complete", key="quiz_score")
 
         # TAB 3: SUMMARIES
         elif tabs == "Summaries":
             if subject == "General Chat": 
-                st.warning("Open a course.")
+                st.warning("Open a notebook.")
             else:
-                if st.button("Generate Summary", width="stretch", type="primary", icon=":material/bolt:"):
+                if st.button("Generate Summary", use_container_width=True, type="primary", icon=":material/bolt:"):
                     with st.spinner("Reading..."):
-                        st.session_state.summaries[subject] = generate_summary(subject)
+                        st.session_state.summaries[subject] = generate_summary(st.session_state.username, subject)
                         st.rerun()
                 
                 if subject in st.session_state.summaries:
                     summary_text = st.session_state.summaries[subject]
-                    st.markdown(summary_text)
+                    with st.container(border=True):
+                        st.markdown(summary_text)
                     
                     st.divider()
                     
-                    # --- NEW DOWNLOAD BUTTON ---
                     from agent_tools import create_pdf_bytes
                     
                     pdf_data = create_pdf_bytes(summary_text, title=f"Summary: {subject}")
@@ -343,6 +432,7 @@ elif st.session_state.current_view == "Course":
                         file_name=f"{subject}_Summary.pdf",
                         mime="application/pdf",
                         icon=":material/download:",
+                        type="primary",
                         use_container_width=True
                     )
 
@@ -351,38 +441,44 @@ elif st.session_state.current_view == "Course":
         elif tabs == "Flashcards":
             st.subheader(":material/style: Flashcards")
             if subject == "General Chat": 
-                st.warning("Open a course to use flashcards.")
+                st.warning("Open a notebook to use flashcards.")
             else:
-                # Add a clear check if documents actually exist
-                files = list_files(subject)
+                files = list_files(st.session_state.username, subject)
                 if not files:
                     st.info("Please upload some PDFs first to generate flashcards.")
                 else:
-                    if st.button("Generate Deck", type="primary"):
-                        with st.spinner("Creating cards..."):
-                            # Clear old cards first to ensure the UI sees a change
+                    if st.button("Generate Deck", type="primary", use_container_width=True, icon=":material/auto_awesome:"):
+                        with st.container(border=True):
+                            lottie_cards = load_lottieurl("https://lottie.host/bd7dc339-bb74-4b53-83ff-a1851e0bc67a/7xH4oT0x4A.json")
+                            if lottie_cards: st_lottie(lottie_cards, height=150)
+                            st.info("Extracting key concepts for flashcards...")
                             st.session_state.flashcards[subject] = [] 
                             
-                            cards = generate_flashcards(subject)
+                            cards = generate_flashcards(st.session_state.username, subject)
                             if cards:
                                 st.session_state.flashcards[subject] = cards
                                 st.session_state.flipped = {i: False for i in range(len(cards))}
-                                st.rerun() # Force immediate UI update
+                                st.rerun()
                             else:
                                 st.error("Could not find enough content. Try uploading another PDF.")
                     
                     deck = st.session_state.flashcards.get(subject, [])
                     if deck:
                         st.divider()
-                        # Use columns to make them look like a stack or a grid
+                        cols = st.columns(2)
                         for i, card in enumerate(deck):
-                            is_flipped = st.session_state.flipped.get(i, False)
-                            # Show "Back" if flipped, else "Front"
-                            content = card["back"] if is_flipped else card["front"]
-                            sub_label = "**DEFINITION** (Click to see term)" if is_flipped else "**TERM** (Click to see definition)"
-                            
-                            if st.button(f"{content}\n\n{sub_label}", key=f"card_{i}_{subject}", width="stretch"):
-                                st.session_state.flipped[i] = not is_flipped
-                                st.rerun()
+                            with cols[i % 2]:
+                                is_flipped = st.session_state.flipped.get(i, False)
+                                with st.container(border=True):
+                                    if not is_flipped:
+                                        st.markdown(f"<div style='text-align: center; min-height: 150px; display: flex; align-items: center; justify-content: center;'><h3 style='color: #2da44e;'>{card['front']}</h3></div>", unsafe_allow_html=True)
+                                        if st.button("Show Definition", key=f"flip_{i}_{subject}", use_container_width=True):
+                                            st.session_state.flipped[i] = True
+                                            st.rerun()
+                                    else:
+                                        st.markdown(f"<div style='min-height: 150px; padding: 10px;'>{card['back']}</div>", unsafe_allow_html=True)
+                                        if st.button("Flip Back", key=f"flip_{i}_{subject}", use_container_width=True, type="primary"):
+                                            st.session_state.flipped[i] = False
+                                            st.rerun()
                     else:
                         st.info("No flashcards yet. Click 'Generate Deck'.")
