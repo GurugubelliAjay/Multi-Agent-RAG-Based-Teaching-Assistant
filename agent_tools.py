@@ -225,7 +225,7 @@ def grade_documents(question, documents, status_container=None):
         res = (prompt | llm).invoke({"question": question, "doc_text": doc_text}).content
         match = re.search(r'\[.*\]', res, re.DOTALL)
         if match:
-            relevant_ids = json.loads(match.group(0))
+            relevant_ids = json.loads(match.group(0), strict=False)
             filtered_docs = [documents[i] for i in relevant_ids if isinstance(i, int) and i < len(documents)]
             if status_container: status_container.write(f"*Filtering Complete:* Kept **{len(filtered_docs)}/{len(documents)}** relevant chunks.")
             print(f"DEBUG: Batch Grader kept {len(filtered_docs)}/{len(documents)} docs.")
@@ -272,7 +272,7 @@ def planner_agent(question, status_container=None):
         res = llm.invoke(prompt).content
         match = re.search(r'\[.*\]', res, re.DOTALL)
         if match: 
-            sub_qs = json.loads(match.group(0))
+            sub_qs = json.loads(match.group(0), strict=False)
             if status_container: status_container.write(f"*Sub-queries generated:* `{sub_qs}`")
             return sub_qs
     except Exception as e:
@@ -355,7 +355,7 @@ def evaluation_agent(question, answer, relevant_docs, start_time, status_contain
     try:
         res = llm.invoke(prompt).content
         match = re.search(r'\{.*\}', res, re.DOTALL)
-        metrics = json.loads(match.group(0))
+        metrics = json.loads(match.group(0), strict=False)
     except:
         metrics = {"confidence_score": "N/A", "accuracy_score": "N/A", "retrieval_precision": "N/A"}
         
@@ -398,8 +398,23 @@ def agentic_rag_response(username, subject, question, status_container=None):
         return "I checked your notes, but I couldn't find relevant information. Please try rephrasing."
         
     context_text = "\n\n".join([d.page_content for d in all_relevant_docs])
-    unique_sources = set([f"- *{os.path.basename(doc.metadata.get('source', 'Unknown'))}* (Page {doc.metadata.get('page', 0) + 1})" for doc in all_relevant_docs])
-    sources_text = "\n\n**Sources Used:**\n" + "\n".join(unique_sources)
+    
+    unique_sources = set()
+    for doc in all_relevant_docs:
+        source_path = doc.metadata.get('source', 'Unknown')
+        source_name = os.path.basename(str(source_path)) if source_path else "Unknown"
+        
+        page_val = doc.metadata.get('page')
+        page_str = "Unknown"
+        if page_val is not None:
+            try:
+                page_str = str(int(page_val) + 1)
+            except (ValueError, TypeError):
+                page_str = str(page_val)
+                
+        unique_sources.add(f"- *{source_name}* (Page {page_str})")
+        
+    sources_text = "\n\n**Sources Used:**\n" + "\n".join(sorted(list(unique_sources)))
 
     # 4. GENERATE
     if status_container: status_container.write("**Generator Agent:** Drafting initial response using verified context...")
@@ -603,7 +618,7 @@ def generate_quiz(username, subject):
         # 3. Decode only the valid JSON part
         # raw_decode returns (parsed_object, end_index)
         # We only care about the parsed_object
-        parsed_json, _ = json.JSONDecoder().raw_decode(clean_res[start_idx:])
+        parsed_json, _ = json.JSONDecoder(strict=False).raw_decode(clean_res[start_idx:])
         
         return parsed_json
             
@@ -685,7 +700,7 @@ def generate_flashcards(username, subject):
         
         if match:
             json_str = match.group(0)
-            return json.loads(json_str)
+            return json.loads(json_str, strict=False)
         else:
             print(f"DEBUG: No JSON array found in response: {res[:100]}")
             return []
