@@ -17,3 +17,10 @@ subjects/
 chat_history.db
 check_db.py
 # requirements.txt
+
+# Conference Paper & Plots
+*.tex
+*.pdf
+*.aux
+*.log
+generate_plots.py

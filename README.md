@@ -1,24 +1,39 @@
-# 🎓 AI-Powered Multi-Agent Teaching Assistant Using RAG
+# 🎓 Multi-Agent RAG for Syllabus-Constrained AI Tutoring
 
-An advanced, Agentic Retrieval-Augmented Generation (RAG) platform that transforms static academic PDFs into an interactive, self-verifying, and hallucination-free study companion.
+An advanced, Multi-Agent Retrieval-Augmented Generation (RAG) architecture designed to strictly enforce pedagogical boundaries and eliminate "Knowledge Bleed" in educational AI systems.
 
-Unlike standard AI chatbots that suffer from "amnesia" or invent facts outside the syllabus, this system uses a team of specialized AI agents to grade retrieved documents, rewrite vague queries, and cross-reference answers against your specific course materials.
+Unlike standard AI chatbots that suffer from conversational amnesia or invent facts outside the syllabus (Epistemic Boundary Violations), this system uses a latency-optimized **Two-Gate Verification Pipeline** and a team of specialized AI agents to guarantee syllabus accuracy.
 
 ---
 
-## ✨ Core Features
+## ✨ Core Research & Architecture Features
 
-- **🧠 Semantic Chunking:** Replaces "dumb" character-count splitting. It reads PDFs sentence by sentence and splits text based on meaning (using a 95th-percentile cosine distance threshold), ensuring definitions and complex concepts stay perfectly intact.
-- **🛡️ Zero-Hallucination Multi-Agent Workflow:**
-  - **Query Rewriter Agent:** Fixes vague follow-up questions using chat history (e.g., changes "What are its advantages?" to "What are the advantages of a Stack?").
-  - **Document Grader Agent (CRAG):** Evaluates retrieved text chunks and throws away irrelevant data before the AI reads it.
-  - **Hallucination Checker Agent:** Acts as the final boss, cross-referencing the drafted answer against the textbook to guarantee 100% syllabus accuracy.
-- **⚡ Active Recall Generation:** Instantly generates tailored Multiple Choice Quizzes, Flashcards, and 1-page Summaries using robust JSON parsing (`raw_decode`) and "Jittered Retrieval" to prevent repetitive questions.
+- **🛡️ Two-Gate Verification Pipeline:** A novel "early-exit" strategy for LLM reflection. A deterministic fuzzy-matcher (Gate 1) evaluates drafts in milliseconds. Only flagged drafts are passed to the heavy LLM Critic (Gate 2), reducing average inference latency by 27.3% compared to standard iterative reflection (Reflexion) while *increasing* factual faithfulness.
+- **🧠 Two-Pass Semantic Chunking:** Replaces arbitrary character-count splitting. It utilizes sentence embeddings and standard-deviation thresholds to identify natural topic boundaries, paired with a strict character cap to preserve complex academic definitions.
+- **🤖 Multi-Agent Orchestration:** 
+  - **Query Rewriter & Planner:** Fixes conversational amnesia and decomposes complex multi-part queries.
+  - **Document Grader (CRAG):** Evaluates retrieved text chunks and discards irrelevant data prior to generation.
+  - **Repair Agent:** Iteratively scrubs hallucinated out-of-syllabus facts from the generated draft.
+- **⚡ Active Recall Generation:** Instantly generates tailored Multiple Choice Quizzes, Flashcards, and 1-page Summaries.
 - **🎙️ Multimodal Voice Input:** Speak naturally to the assistant using integrated real-time voice-to-text functionality.
 
 ---
 
-## 🛠️ Tech Stack
+## 📊 Performance Benchmarks
+Evaluated via the **Ragas framework** on a curated probing dataset for Data Structures and Algorithms (DSA). Our Proposed Two-Gate system successfully prevented "Reflection Degradation" (over-editing) caused by forced pure-LLM loops, achieving the highest pedagogical safety.
+
+| Architecture | Faithfulness | Answer Relevancy | Context Precision | Context Recall | End-to-End Latency |
+|--------------|--------------|------------------|-------------------|----------------|--------------------|
+| **Basic RAG** | 0.7875 | 0.9297 | 0.7542 | 0.8000 | ~15.0s |
+| **CRAG Baseline** | 0.9487 | 0.9207 | 0.8430 | **0.9500** | 24.2s |
+| **Reflexion Baseline** | 0.8988 | 0.8767 | **0.8622** | **0.9500** | 45.4s |
+| **Proposed Two-Gate** | **0.9557** | 0.9207 | 0.8469 | **0.9500** | **33.0s** |
+
+*(Note: End-to-End latency includes heavy API network transit and automated rate-limit queuing on the Groq free tier).*
+
+---
+
+## 🛠️ Technology Stack
 
 | Component | Technology |
 |-----------|------------|
@@ -62,7 +77,7 @@ pip install -r requirements.txt
 
 ### 4. Configure Environment Variables
 
-Create a `.env` file in the root directory of the project and add your Groq API key:
+Create a `.env` file in the root directory of the project and add your Groq API key (used for lightning-fast Llama-3 inference):
 ```ini
 GROQ_API_KEY=your_groq_api_key_here
 ```

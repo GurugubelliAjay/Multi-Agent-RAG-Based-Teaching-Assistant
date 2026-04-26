@@ -1,15 +1,17 @@
 import os
+import json
 from dotenv import load_dotenv
 load_dotenv()
 
 # --- STANDARD IMPORTS ---
 import streamlit as st
-from streamlit_mic_recorder import mic_recorder
 from langchain_groq import ChatGroq
 import requests
 from streamlit_lottie import st_lottie
 import streamlit_shadcn_ui as ui
 import streamlit_antd_components as sac
+import streamlit.components.v1 as components
+from streamlit_mic_recorder import mic_recorder
 
 @st.cache_data
 def load_lottieurl(url: str):
@@ -26,7 +28,7 @@ from agent_tools import (get_rag_chain, handle_file_upload, delete_file, list_fi
                          delete_subject, generate_quiz, generate_summary, 
                          load_chat_history, save_message, clear_chat_history, 
                          generate_flashcards, transcribe_audio,
-                         register_user, authenticate_user,
+                         register_user, authenticate_user, generate_suggested_questions,
                          create_session, get_username_from_session, destroy_session)
 
 st.set_page_config(page_title="Student Hub", page_icon=":material/school:", layout="wide")
@@ -48,45 +50,64 @@ if not st.session_state.authenticated and "session_token" in st.query_params:
         del st.query_params["session_token"] # Clean up invalid/expired tokens
 
 if not st.session_state.authenticated:
-    col1, col2, col3 = st.columns([1, 2, 1])
+    # Use slightly tighter columns to make the login card look better proportioned
+    col1, col2, col3 = st.columns([1.2, 1.5, 1.2])
     with col2:
         lottie_hello = load_lottieurl("https://lottie.host/65e94b43-6901-4ec9-8666-6b2256422b40/gK7P59hWw4.json")
         if lottie_hello:
-            st_lottie(lottie_hello, height=200, key="hello")
-        st.title("Welcome to Student Hub")
+            st_lottie(lottie_hello, height=180, key="hello")
+            
+        st.markdown("<h2 style='text-align: center; margin-top: -20px;'>Welcome to Student Hub</h2>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: #64748b; margin-bottom: 20px;'>Your AI-powered study companion.</p>", unsafe_allow_html=True)
         
-        tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
+        # Use consistent Ant Design tabs
+        auth_tab = sac.tabs([
+            sac.TabsItem(label='Login', icon='box-arrow-in-right'),
+            sac.TabsItem(label='Sign Up', icon='person-plus')
+        ], align='center', size='md', variant='outline', color='#2da44e')
         
-        with tab_login:
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        if auth_tab == 'Login':
             with st.form("login_form", border=True):
-                user = st.text_input("Username")
-                pwd = st.text_input("Password", type="password")
+                user = st.text_input("Username", placeholder="Enter your username")
+                pwd = st.text_input("Password", type="password", placeholder="Enter your password")
+                
+                st.markdown("<br>", unsafe_allow_html=True)
                 if st.form_submit_button("Login", type="primary", use_container_width=True):
+                    print(f"DEBUG [web_app]: User '{user}' attempting login...")
                     if authenticate_user(user, pwd):
                         st.session_state.authenticated = True
                         st.session_state.username = user
+                        print(f"DEBUG [web_app]: User '{user}' logged in successfully.")
                         token = create_session(user)
                         st.session_state.session_token = token
                         st.query_params["session_token"] = token # Add token to URL
                         st.rerun()
                     else:
+                        print(f"DEBUG [web_app]: User '{user}' login failed (invalid credentials).")
                         st.error("Invalid username or password.")
                         
-        with tab_signup:
+        elif auth_tab == 'Sign Up':
             with st.form("signup_form", border=True):
-                new_user = st.text_input("Choose a Username")
-                new_pwd = st.text_input("Choose a Password", type="password")
-                confirm_pwd = st.text_input("Confirm Password", type="password")
+                new_user = st.text_input("Username", placeholder="Choose a username")
+                new_pwd = st.text_input("Password", type="password", placeholder="Create a password")
+                confirm_pwd = st.text_input("Confirm Password", type="password", placeholder="Confirm your password")
+                
+                st.markdown("<br>", unsafe_allow_html=True)
                 if st.form_submit_button("Sign Up", type="primary", use_container_width=True):
                     if new_pwd != confirm_pwd:
                         st.error("Passwords do not match.")
                     elif len(new_user) < 3 or len(new_pwd) < 6:
                         st.error("Username must be at least 3 characters and password at least 6 characters.")
                     else:
+                        print(f"DEBUG [web_app]: User '{new_user}' attempting sign up...")
                         if register_user(new_user, new_pwd):
                             st.success("Account created successfully! You can now log in.")
+                            print(f"DEBUG [web_app]: User '{new_user}' registered successfully.")
                         else:
                             st.error("Username already exists. Please choose another one.")
+                            print(f"DEBUG [web_app]: User '{new_user}' registration failed (username exists).")
     st.stop()
 
 # --- MASTER CSS STYLING ---
@@ -147,6 +168,12 @@ st.markdown("""
         outline: none !important;
     }
     
+    /* 5. HIDE "Press Enter to apply/submit" HINTS */
+    [data-testid="InputInstructions"],
+    [data-testid="stInputInstructions"] {
+        display: none !important;
+    }
+    
 </style>
 """, unsafe_allow_html=True)
 
@@ -159,6 +186,7 @@ if "summaries" not in st.session_state: st.session_state.summaries = {}
 if "flashcards" not in st.session_state: st.session_state.flashcards = {}
 if "flipped" not in st.session_state: st.session_state.flipped = {}
 if "last_audio" not in st.session_state: st.session_state.last_audio = None
+if "suggestions" not in st.session_state: st.session_state.suggestions = {}
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -262,11 +290,13 @@ elif st.session_state.current_view == "Course":
                     new_files = [f for f in up if f.name not in existing_files]
                     
                     if new_files:
+                        print(f"DEBUG [web_app]: Uploading {len(new_files)} new files for subject '{subject}'...")
                         with st.spinner("Processing New Files..."):
                             handle_file_upload(st.session_state.username, subject, new_files)
                         
                         # THE FIX: Increment the key to clear the uploader UI
                         st.session_state.uploader_key += 1
+                        st.session_state.suggestions.pop(subject, None) # Refresh suggestions
                         st.rerun() 
 
                 st.divider()
@@ -283,7 +313,9 @@ elif st.session_state.current_view == "Course":
                         # Red-styled delete button for files
                         fc2.markdown('<div class="danger-zone"></div>', unsafe_allow_html=True)
                         if fc2.button("", key=f"del_{f}", icon=":material/delete:", type="primary"): 
+                            print(f"DEBUG [web_app]: Deleting file '{f}' from subject '{subject}'...")
                             delete_file(st.session_state.username, subject, f)
+                            st.session_state.suggestions.pop(subject, None) # Refresh suggestions
                             st.rerun()
                 
                 st.divider()
@@ -304,34 +336,60 @@ elif st.session_state.current_view == "Course":
         
         # TAB 1: CHAT
         if tabs == "Chat":
+            suggestion_clicked = None
             history = load_chat_history(st.session_state.username, subject)
             chat_con = st.container(height=450, border=True)
             with chat_con:
-                for m in history:
-                    with st.chat_message(m["role"]): st.markdown(m["content"])
-            
-            prompt = st.chat_input("Type a message...")
+                for i, m in enumerate(history):
+                    with st.chat_message(m["role"]): 
+                        st.markdown(m["content"])
+                    
+                # Display suggestions as an assistant message (Icebreakers)
+                if subject != "General Chat":
+                    if subject not in st.session_state.suggestions:
+                        with st.chat_message("assistant"):
+                            spinner_msg = "Generating follow-ups..." if len(history) > 0 else "Generating questions..."
+                            with st.spinner(spinner_msg):
+                                st.session_state.suggestions[subject] = generate_suggested_questions(st.session_state.username, subject, history)
+                                st.rerun() # Immediately refresh to display the pills!
 
-            c_voice, c_reset = st.columns([0.15, 0.85])
+                    suggs = st.session_state.suggestions.get(subject, [])
+                    if suggs:
+                        with st.chat_message("assistant"):
+                            st.markdown("💡 **Suggested Follow-ups:**" if len(history) > 0 else "💡 **Here are some questions to get you started:**")
+                            for idx, sq in enumerate(suggs):
+                                st.markdown('<div class="suggestion-pill"></div>', unsafe_allow_html=True)
+                                if st.button(sq, key=f"sq_{idx}_{subject}", use_container_width=True, type="secondary"):
+                                    suggestion_clicked = sq
+            
+            # Swapped columns: Voice (left) and Input (right)
+            c_voice, c_input = st.columns([0.09, 0.91], vertical_alignment="bottom")
+            
             with c_voice:
-                audio = mic_recorder(start_prompt="Speak", stop_prompt="Stop", key='recorder')
-            with c_reset:
-                if st.button("Clear Chat", use_container_width=True, type="secondary", icon=":material/delete_sweep:"):
-                    clear_chat_history(st.session_state.username, subject)
-                    st.session_state.last_audio = None 
-                    st.toast(f"Chat history for {subject} cleared!")
-                    st.rerun()
+                audio = mic_recorder(start_prompt="🎙️", stop_prompt="🛑", key='recorder')
+            with c_input:
+                prompt = st.chat_input("Type a message...")
+            
+            if st.button("Clear Chat", use_container_width=True, type="secondary", icon=":material/delete_sweep:"):
+                clear_chat_history(st.session_state.username, subject)
+                st.session_state.last_audio = None 
+                st.session_state.suggestions.pop(subject, None)
+                st.toast(f"Chat history for {subject} cleared!")
+                st.rerun()
 
             final_input = None
             if prompt: final_input = prompt
+            elif suggestion_clicked: final_input = suggestion_clicked
             elif audio:
-                if audio['bytes'] != st.session_state.last_audio:
-                    st.session_state.last_audio = audio['bytes']
+                audio_bytes = audio["bytes"]
+                if audio_bytes != st.session_state.last_audio:
+                    st.session_state.last_audio = audio_bytes
                     with st.spinner("Transcribing..."):
-                        text = transcribe_audio(audio['bytes'])
+                        text = transcribe_audio(audio_bytes)
                         if text: final_input = text
             
             if final_input:
+                print(f"DEBUG [web_app]: Processing user input '{final_input}' in '{subject}'...")
                 save_message(st.session_state.username, subject, "user", final_input)
                 with chat_con:
                     with st.chat_message("user"): st.markdown(final_input)
@@ -345,31 +403,48 @@ elif st.session_state.current_view == "Course":
                 else:
                     with chat_con:
                         with st.chat_message("assistant"):
-                            with st.status("Initiating Multi-Agent Workflow...", expanded=True) as status:
+                            with st.status("Researching your notes...", expanded=True) as status:
                                 from agent_tools import agentic_rag_response
                                 ans = agentic_rag_response(st.session_state.username, subject, final_input, status_container=status)
                                 
-                                if "I checked your notes, but" in ans:
+                                if "I'm sorry, but I cannot find" in ans or "I checked your notes, but" in ans:
                                     status.update(label="No relevant notes found", state="error", expanded=False)
                                 elif "Warning:" in ans: 
                                     status.update(label="Fact-check warning", state="error", expanded=False)
                                 else:
-                                    status.update(label="Verified Answer Generated", state="complete", expanded=False)
+                                    status.update(label="Answer generated", state="complete", expanded=False)
                             st.markdown(ans)
                 
                 save_message(st.session_state.username, subject, "assistant", ans)
+                
+                # Generate follow-up suggestions before rerunning the app
+                if subject != "General Chat":
+                    with chat_con:
+                        with st.chat_message("assistant"):
+                            with st.spinner("Generating follow-ups..."):
+                                # Pass the current turn's context into the history manually since it hasn't reloaded yet
+                                updated_history = history + [
+                                    {"role": "user", "content": final_input}, 
+                                    {"role": "assistant", "content": ans}
+                                ]
+                                st.session_state.suggestions[subject] = generate_suggested_questions(st.session_state.username, subject, updated_history)
+                else:
+                    st.session_state.suggestions.pop(subject, None)
+                
                 st.rerun()
 
         # TAB 2: QUIZ
         elif tabs == "Quiz":
             if subject == "General Chat": st.warning("Open a notebook.")
             else:
+                quiz_topic = st.text_input("Topic (Optional)", placeholder="Leave blank for a random mix of concepts", key="quiz_topic")
                 if st.button("New Quiz", use_container_width=True, type="primary", icon=":material/casino:"):
+                    print(f"DEBUG [web_app]: Generating New Quiz for '{subject}' with topic '{quiz_topic}'...")
                     with st.container(border=True):
                         lottie_quiz = load_lottieurl("https://lottie.host/26251b5c-4e4f-4d92-80ea-3e75b9ea8925/tC6AylD6s0.json")
                         if lottie_quiz: st_lottie(lottie_quiz, height=150)
-                        st.info("Generating your personalized quiz...")
-                        st.session_state.quiz_data[subject] = generate_quiz(st.session_state.username, subject)
+                        st.info(f"Generating your personalized quiz {f'on {quiz_topic}' if quiz_topic else ''}...")
+                        st.session_state.quiz_data[subject] = generate_quiz(st.session_state.username, subject, quiz_topic)
                         st.rerun()
                 
                 if subject in st.session_state.quiz_data:
@@ -410,9 +485,11 @@ elif st.session_state.current_view == "Course":
             if subject == "General Chat": 
                 st.warning("Open a notebook.")
             else:
+                summary_topic = st.text_input("Topic (Optional)", placeholder="Leave blank for a general overview", key="summary_topic")
                 if st.button("Generate Summary", use_container_width=True, type="primary", icon=":material/bolt:"):
+                    print(f"DEBUG [web_app]: Generating Summary for '{subject}' with topic '{summary_topic}'...")
                     with st.spinner("Reading..."):
-                        st.session_state.summaries[subject] = generate_summary(st.session_state.username, subject)
+                        st.session_state.summaries[subject] = generate_summary(st.session_state.username, subject, summary_topic)
                         st.rerun()
                 
                 if subject in st.session_state.summaries:
@@ -447,14 +524,16 @@ elif st.session_state.current_view == "Course":
                 if not files:
                     st.info("Please upload some PDFs first to generate flashcards.")
                 else:
+                    flashcard_topic = st.text_input("Topic (Optional)", placeholder="Leave blank for random key concepts", key="flashcard_topic")
                     if st.button("Generate Deck", type="primary", use_container_width=True, icon=":material/auto_awesome:"):
+                        print(f"DEBUG [web_app]: Generating Flashcards for '{subject}' with topic '{flashcard_topic}'...")
                         with st.container(border=True):
                             lottie_cards = load_lottieurl("https://lottie.host/bd7dc339-bb74-4b53-83ff-a1851e0bc67a/7xH4oT0x4A.json")
                             if lottie_cards: st_lottie(lottie_cards, height=150)
-                            st.info("Extracting key concepts for flashcards...")
+                            st.info(f"Extracting concepts for flashcards {f'on {flashcard_topic}' if flashcard_topic else ''}...")
                             st.session_state.flashcards[subject] = [] 
                             
-                            cards = generate_flashcards(st.session_state.username, subject)
+                            cards = generate_flashcards(st.session_state.username, subject, flashcard_topic)
                             if cards:
                                 st.session_state.flashcards[subject] = cards
                                 st.session_state.flipped = {i: False for i in range(len(cards))}
@@ -476,7 +555,7 @@ elif st.session_state.current_view == "Course":
                                             st.session_state.flipped[i] = True
                                             st.rerun()
                                     else:
-                                        st.markdown(f"<div style='min-height: 150px; padding: 10px;'>{card['back']}</div>", unsafe_allow_html=True)
+                                        st.markdown(f"<div style='min-height: 150px; padding: 10px;'>\n\n{card['back']}\n\n</div>", unsafe_allow_html=True)
                                         if st.button("Flip Back", key=f"flip_{i}_{subject}", use_container_width=True, type="primary"):
                                             st.session_state.flipped[i] = False
                                             st.rerun()
